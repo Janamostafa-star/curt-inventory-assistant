@@ -8,16 +8,15 @@ status rather than throwing or returning `None` silently. I chose to surface thi
 plainly ("I couldn't find X in the inventory") instead of trying to auto-correct to
 something unrelated — a wrong guess felt worse than admitting nothing matched.
 
-**Misspellings.** I split this deliberately between the two phases. Phase 2 uses
-`difflib` fuzzy matching inside `InventoryService`, and the LLM is instructed (via the
-system prompt) to state when it silently corrected something — e.g. "Showing results
-for Brake Pads" — so the user isn't confused about which part they're actually looking
-at. Phase 1 does *not* get fuzzy matching: the brief specifies it should use only
-if/else or keyword matching with no AI model involved, and I felt that adding a fuzzy
-layer would blur that line and misrepresent what "rule-based" means for the reviewer.
-Instead, a misspelling in Phase 1 just falls through to the generic help message. This
-is a real capability gap between the two phases, and I think it's a useful one to show
-side-by-side in the demo — it's the clearest illustration of why Phase 2 exists.
+**Misspellings.** Rather than build separate correction logic for each phase, I put
+fuzzy matching (`difflib`, via `InventoryService.find_part` / `find_category`) into the
+shared data-access layer, so both Phase 1 and Phase 2 benefit from the same matcher and
+stay consistent with each other. Phase 1 states the correction directly in its
+templated response ("Showing results for Brake Pads."); Phase 2's system prompt gives
+the LLM the same instruction, so a typo is never silently substituted in either phase —
+the user always sees what was actually matched. Keeping this logic in one place also
+means a future improvement to the matching (e.g. better handling of abbreviations)
+automatically benefits both phases without duplicated work.
 
 **Ambiguous matches.** When more than one part or category name is plausible, both
 phases return an `ambiguous` status with a list of suggestions instead of picking one
@@ -42,21 +41,33 @@ user asks or agrees — an assistant that files shortage reports on its own init
 without being asked, felt like the wrong default for something that might trigger a
 real reorder process later.
 
+**Gemini availability.** During testing I repeatedly hit transient `503`
+("high demand") and `504` (timeout) errors from Gemini's free tier, and once a genuine
+`404` when a model I'd initially chosen (`gemini-2.5-flash`) turned out to have been
+deprecated for new API keys since I started this project. This pushed me to add a
+configurable fallback chain (`GEMINI_FALLBACK_MODELS`) rather than hardcoding one model
+name — `_generate()` tries the primary model, and on a transient error walks through
+the fallback list in order, stopping at the first one that succeeds. A non-transient
+error (bad key, deprecated model) is raised immediately rather than wasted on retries.
+This turned into one of the more realistic "production AI system" problems I ran into,
+closer to what the task brief was actually testing for than anything I could have
+planned for in advance.
+
 ## What I'd improve with more time
 
 - **Persistence for conversation memory.** Right now sessions live in a plain
   in-memory dict and vanish on server restart. Fine for the brief, but I'd want Redis
   or a lightweight DB-backed store for anything closer to real use.
-- **Fuzzy matching in Phase 1**, gated behind a flag, so a reviewer could see what a
-  "rule-based + fuzzy" hybrid looks like without it being the default and without
-  contradicting the "no AI model" constraint.
-- **Faster/more consistent Phase 2 latency.** Response times ranged from ~3s to ~30s
-  depending on which model in the fallback chain ended up answering. I'd like to
-  explore streaming responses so the UI shows partial output while a slower fallback
-  model is still working, instead of one long spinner.
+- **Faster/more consistent Phase 2 latency.** Response times vary depending on which
+  model in the fallback chain ends up answering. I'd like to explore streaming
+  responses so the UI shows partial output while a slower fallback model is still
+  working, instead of one long spinner.
 - **Authentication and rate limiting** on the FastAPI endpoints — currently anyone who
   can reach the server can call `/chat` freely, which is fine for a local demo but
   wouldn't be fine for anything shared beyond the team.
 - **Structured logging/metrics** on tool calls (which tools get used most, how often
   fuzzy correction triggers) — useful for understanding real usage patterns if this
   were rolled out to the team for real.
+- **Inventory updates through tool calling** (e.g. an `update_quantity` tool), with an
+  explicit user-confirmation step before any write — the read-only tools in this
+  submission were a deliberate scope decision for the 5-day timeline.

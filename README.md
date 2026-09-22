@@ -11,6 +11,11 @@ phases:
 Both phases share one database and one data-access layer (`InventoryService`) — the LLM
 never touches SQL directly.
 
+**Live demo:** https://illustrious-essence-production.up.railway.app
+
+See [`REFLECTION.md`](REFLECTION.md) for design decisions and what I'd improve with
+more time.
+
 ---
 
 ## 1. Architecture
@@ -37,6 +42,8 @@ never touches SQL directly.
 **Key design point:** `InventoryService` (in `app/service.py`) is the *only* place in
 the project that runs SQL. Phase 1's parser and Phase 2's tool layer both call it —
 neither writes queries directly, and Gemini never sees the database, only tool results.
+This also means fuzzy name-matching (§6, §7) lives in one place and both phases benefit
+from it identically, rather than each phase implementing its own correction logic.
 
 ### Request flow, Phase 2
 
@@ -51,6 +58,9 @@ neither writes queries directly, and Gemini never sees the database, only tool r
    repeats (up to 5 iterations) until Gemini returns plain text.
 6. The full turn (user message, model turns, tool calls/results) is saved into
    `conversations[session_id]` — an in-memory dict, trimmed to the last 20 messages.
+7. If the primary model (`GEMINI_MODEL`) returns a transient error (429/500/502/503/504),
+   `_generate()` retries with each model listed in `GEMINI_FALLBACK_MODELS`, in order,
+   before giving up with a friendly error message.
 
 ---
 
@@ -64,6 +74,7 @@ neither writes queries directly, and Gemini never sees the database, only tool r
 | Frontend      | Streamlit                                |
 | Tests         | pytest                                   |
 | Secrets       | `python-dotenv`, `.env` (not committed)  |
+| Deployment    | Railway (bonus)                          |
 
 Full dependency list: see `requirements.txt`.
 
@@ -107,8 +118,8 @@ DB_PATH=curt_inventory.db
 API_URL=http://localhost:8000
 ```
 
-`.env` is git-ignored — never commit real keys. `.env.example` (below) is the template
-that ships in the repo instead.
+`.env` is git-ignored — never commit real keys. `.env.example` (in the repo) is the
+template that ships instead, with placeholder values only.
 
 ### Set up / seed the database
 
@@ -183,12 +194,14 @@ runs SQL:
 | `get_by_category(category)` | exact, case-insensitive category lookup |
 | `update_quantity(name, delta)` | adjusts stock, raises if it would go negative |
 | `get_categories()` | distinct category list |
-| `find_part(text)` | fuzzy-resolves messy user text to a real part (see §6) |
+| `find_part(text)` | fuzzy-resolves messy user text to a real part (see §6, §7) |
 | `find_category(text)` | same, for categories |
 
 `find_part` / `find_category` use `difflib`-based matching (`_match()`) to turn
 misspelled or partial input into a confident match, a set of suggestions, or an
-"ambiguous" / "not found" result — this is what both phases use for edge-case handling.
+"ambiguous" / "not found" result — this is what **both** Phase 1 and Phase 2 use for
+edge-case handling, so a typo like "break pads" is corrected consistently regardless
+of which phase answers it.
 
 ---
 
@@ -225,7 +238,9 @@ Response:
 }
 ```
 
-- `session_id` (1–100 chars) and `message` (1–500 chars) are required.
+- `session_id` (1–100 chars) and `message` (1–500 chars) are required and validated at
+  the API layer (Pydantic `Field(min_length=..., max_length=...)`); empty or oversized
+  input returns HTTP 422 before it ever reaches Gemini.
 - Conversation history is kept in memory per `session_id` (lost on server restart).
 - Errors never crash the endpoint: LLM/API failures return HTTP 502 with a friendly
   message; the underlying `chat()` function itself never raises.
@@ -263,8 +278,9 @@ calling `InventoryService`):
 
 The model decides when to call which tool based on the user's message; the system
 prompt (in `app/llm.py`) instructs it to never invent inventory facts, to only call
-`flag_shortage` after the user asks or agrees, and to use match-type hints (`corrected`,
-`partial`) to tell the user when it silently fixed a typo.
+`flag_shortage` after the user asks or agrees, and to state match-type hints
+(`corrected`, `partial`) transparently so the user knows when a typo was silently
+fixed.
 
 **Reliability:** Gemini calls go through the SDK's built-in retry (4 attempts,
 exponential backoff) for transient errors (429/499/500/502/503/504); if the primary
@@ -278,46 +294,74 @@ model (`GEMINI_MODEL`) still fails, `_generate()` walks through
 | Case | Phase 1 (rule-based) | Phase 2 (LLM) |
 |---|---|---|
 | **Item not in inventory** | `find_part`/`find_category` returns `not_found`; the assistant says so plainly, e.g. *"I couldn't find 'turbo boosters' in the inventory."* | Same underlying `find_part` result surfaces as `found: false, reason: "not_found"`; the model reports it and offers any suggestions rather than guessing. |
-| **Misspelled / partial name** | Regex-only, no fuzzy layer by design (Phase 1 is explicitly "no AI model"). A misspelling like "break pads" won't match any intent pattern well enough and falls back to the generic help message. This is an intentional limitation: adding real fuzzy correction to Phase 1 would blur the line the brief draws between "rule-based" and "LLM-powered." | `InventoryService.find_part` uses `difflib` to fuzzy-match (`match_type: "corrected"`). The model is instructed to state the correction transparently, e.g. *"Showing results for Brake Pads."* rather than silently substituting. |
+| **Misspelled / partial name** | Both phases share `InventoryService.find_part` / `find_category`, which uses `difflib` fuzzy matching (`match_type: "corrected"`). Phase 1 states the correction transparently, e.g. *"Showing results for Brake Pads."* — the same one-source-of-truth matcher that Phase 2 uses, surfaced through Phase 1's own templated response instead of an LLM. | Same underlying `find_part` result; the model is separately instructed (system prompt) to state corrections transparently rather than silently substitute. |
 | **Ambiguous match** (e.g. text matches more than one part/category) | Returns a "did you mean X or Y?" prompt built from the suggestion list, rather than guessing. | Same underlying `ambiguous` status; the model is instructed to ask which one the user meant instead of picking one. |
 | **Missing/ambiguous question** (e.g. "how many do we have" with no item) | `clean_entity()` strips filler words; if nothing is left, the assistant asks *"Which item would you like to check?"* rather than erroring. | The system prompt instructs the model to ask a short clarifying question when no item/category is named, instead of guessing. |
 | **Follow-up context** ("where are they stored?") | Not supported — Phase 1 has no memory, so pronouns (`it`/`they`/`those`) are explicitly treated as "entity missing," prompting the user to name the item. | Full per-session history is sent with every request, and the system prompt tells the model to resolve pronouns from prior turns. |
 | **Low stock** | N/A — Phase 1 doesn't flag shortages. | `check_stock` reports `low_stock: true` under a threshold of 5; the model mentions it and offers to call `flag_shortage`, but only acts after the user agrees. |
+| **Gemini temporarily unavailable** | N/A | `_generate()` retries transient errors via the SDK, then walks `GEMINI_FALLBACK_MODELS`; if every model fails, the user gets a clear "please try again" message instead of a crash or stack trace. |
 
 ---
 
-## 8. Known limitations / future improvements
+## 8. Security
+
+- **No secrets in source control.** `.env` (containing `GEMINI_API_KEY`) is listed in
+  `.gitignore` and was never committed; `.env.example` ships instead, with placeholder
+  values only.
+- **The LLM never touches the database directly.** Gemini only sees tool
+  *declarations* (name, description, JSON schema); every actual call is executed by
+  our own backend code (`app/tools.py:execute_tool`), never by the model itself.
+- **All SQL is parameterized.** Every query in `app/service.py` and `app/db.py` uses
+  `?` placeholders — user input is never interpolated into a SQL string.
+- **Tool calls are validated before execution.** `execute_tool()` only runs tool names
+  present in `TOOL_REGISTRY`, reads only the one expected argument (ignoring anything
+  extra the model might send), rejects empty or oversized argument strings, and
+  catches any exception from the underlying tool so a bug there can't crash the chat.
+- **API input is length-limited.** `POST /chat` validates `session_id` (1–100 chars)
+  and `message` (1–500 chars) via Pydantic before the request reaches Gemini.
+- **Errors never leak internals.** Both `app/llm.py` and `app/main.py` catch
+  exceptions and return short, user-facing messages — no stack traces or raw API
+  errors are ever returned to the client.
+- **No authentication** on the API — acceptable for a local/demo tool per the brief's
+  scope, but flagged in §9 as a gap for any real deployment.
+
+---
+
+## 9. Known limitations / future improvements
 
 - Conversation memory is in-process only (a dict); restarting the FastAPI server clears
   all sessions. Acceptable per the brief, but a real deployment would want Redis or a
   DB-backed store.
 - Gemini's free tier has low daily request quotas per model, which is why a fallback
-  model chain exists — response times can vary widely (a few seconds to ~30s) when a
-  model is under load or a request needs to fall back.
-- Phase 1 has no fuzzy matching by design; a "best of both" mode (rule-based with a
-  fuzzy layer) would be a natural next step if the brief allowed it.
+  model chain exists — response times can vary (typically 1-3s, occasionally longer)
+  when a model is under load or a request needs to fall back.
 - No authentication on the API — fine for a local/demo tool, not for production.
+- See [`REFLECTION.md`](REFLECTION.md) for the full list of what I'd improve with more
+  time.
 
 ---
 
-## 9. Project structure
+## 10. Project structure
 
 ```
 curt_inventory_assistant/
 ├── app/
-│   ├── db.py          # schema, seeding, get_connection()
-│   ├── service.py      # InventoryService — the only SQL in the project
-│   ├── phase1.py        # rule-based intent parsing + answer()
-│   ├── tools.py          # Gemini tool declarations + execute_tool()
-│   ├── llm.py             # Gemini client, tool-calling loop, session memory
-│   └── main.py             # FastAPI app: /chat, /inventory, /health
+│   ├── db.py           # schema, seeding, get_connection()
+│   ├── service.py       # InventoryService — the only SQL in the project
+│   ├── phase1.py         # rule-based intent parsing + answer()
+│   ├── tools.py           # Gemini tool declarations + execute_tool()
+│   ├── llm.py              # Gemini client, tool-calling loop, session memory
+│   └── main.py              # FastAPI app: /chat, /inventory, /health
 ├── tests/
 │   ├── test_service.py
 │   ├── test_phase1.py
 │   ├── test_tools.py
-│   └── test_llm.py
-├── streamlit_app.py    # frontend: phase toggle, chat, inventory sidebar
+│   └── test_llm.py       # scripted fake Gemini client — no API key needed to run
+├── streamlit_app.py     # frontend: phase toggle, chat, inventory sidebar
+├── Procfile              # Railway process definition
+├── railway.json          # Railway deploy config
 ├── requirements.txt
 ├── .env.example
+├── .gitignore
 └── README.md
 ```
