@@ -365,3 +365,5 @@ curt_inventory_assistant/
 ├── .gitignore
 └── README.md
 ```
+## Theoretical Questions
+Answers to the written technical questions are in [`docs/CURT_GenAI_Technical_Questions_Answers.pdf`](docs/CURT_GenAI_Technical_Questions_Answers.pdf).
