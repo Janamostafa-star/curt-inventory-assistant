@@ -2,3 +2,5 @@
 *.db
 __pycache__/
 .venv/
+.agents/
+.claude/
