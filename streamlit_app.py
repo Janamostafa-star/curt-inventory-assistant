@@ -41,6 +41,16 @@ LOW_STOCK_THRESHOLD = 5
 # Streamlit app should still call your real Phase 1 logic against the
 # real database.")
 # --------------------------------------------------------------------------
+# Ensure this service's own local SQLite copy exists and is seeded — each
+# Railway service has an isolated filesystem, so this doesn't share a file
+# with the FastAPI backend's copy. Both are seeded identically, so Phase 1
+# and the inventory sidebar (which both read locally) still work correctly.
+try:
+    from app.db import init_db, seed_db
+    init_db()
+    seed_db()
+except Exception:
+    pass  # surfaced by the existing service/database status checks below
 try:
     from app.service import InventoryService
 
